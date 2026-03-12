@@ -5880,8 +5880,20 @@ handler::ha_optimize(THD* thd, HA_CHECK_OPT* check_opt)
               m_lock_type == F_WRLCK);
   mark_trx_read_write();
 
-  // in-engine optimize can modify rowids, which will break hlindexes
-  return table->s->hlindexes() ? HA_ADMIN_TRY_ALTER : optimize(thd, check_opt);
+  // optimize only the graph quailty
+  if (table->s->hlindexes())
+  {
+    if (table->open_hlindexes_for_write())
+        return HA_ADMIN_FAILED;
+
+    SCOPE_EXIT([this](){ this->table->unlock_hlindexes(); });
+
+    int err= mhnsw_optimize(this->table);
+    return err ? HA_ADMIN_FAILED : HA_ADMIN_OK;
+
+  }
+  return optimize(thd, check_opt); 
+
 }
 
 

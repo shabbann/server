@@ -28,8 +28,8 @@
 static constexpr float NEAREST = -1.0f;
 
 // Algorithm parameters
-static constexpr float alpha = 1.1f;
-static constexpr uint ef_construction= 10;
+static float alpha = 1.1f;
+static uint ef_construction= 10;
 static constexpr uint max_ef= 10000;
 static constexpr size_t subdist_part= 192;
 static constexpr float subdist_margin= 1.05f;
@@ -1723,6 +1723,154 @@ int mhnsw_delete_all(TABLE *table, KEY *keyinfo, bool truncate)
 
   ctx->release(table);
   return 0;
+}
+
+int mhnsw_optimize(TABLE *table)
+{
+  //small hack to not edit the search layer code rn
+  uint tmp_save_ef=ef_construction;
+  ef_construction=40;
+  float tmp_save_alpha=alpha;
+  alpha=1.2f;
+
+  DBUG_ENTER("mhnsw_optimize");
+  TABLE *graph= table->hlindex;
+  MHNSW_Share *ctx;
+  THD *thd= table->in_use;
+
+  int err= MHNSW_Share::acquire(&ctx, table, true);
+  SCOPE_EXIT([ctx, table](){ ctx->release(table); });
+  if (err) DBUG_RETURN(err);
+
+  SCOPE_EXIT([tmp_save_ef, tmp_save_alpha](){
+    ef_construction= tmp_save_ef;
+    alpha= tmp_save_alpha;
+  });
+
+  // currently we do two passes because we can't do a sequential and random
+  // read at the same time
+  //
+  // collect all grefs via sequential
+  Dynamic_array<uchar*> all_grefs(PSI_INSTRUMENT_MEM);
+
+  if ((err= graph->file->ha_rnd_init(1)))
+    DBUG_RETURN(err);
+
+  while (!(err= graph->file->ha_rnd_next(graph->record[0])))
+  {
+    graph->file->position(graph->record[0]);
+    uchar *gref= (uchar*)thd->memdup(graph->file->ref,
+                                     graph->file->ref_length);
+    if (!gref)
+    {
+      graph->file->ha_rnd_end();
+      DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+    }
+    all_grefs.push(gref);
+  }
+  graph->file->ha_rnd_end();
+  if (err != HA_ERR_END_OF_FILE)
+    DBUG_RETURN(err);
+
+  if (all_grefs.size() == 0)
+    DBUG_RETURN(0);
+
+
+  // random reads 
+  if ((err= graph->file->ha_rnd_init(0)))
+    DBUG_RETURN(err);
+  SCOPE_EXIT([graph](){ graph->file->ha_rnd_end(); });
+
+  for (size_t i= 0; i < all_grefs.size(); i++)
+  {
+    if ((err= graph->file->ha_rnd_pos(graph->record[0], all_grefs[i])))
+      DBUG_RETURN(err);
+
+    FVectorNode *node= ctx->get_node(all_grefs[i]);
+    if ((err= node->load_from_record(graph)))
+      DBUG_RETURN(err);
+
+    if (node->deleted)
+      continue;
+
+    for (int layer= node->max_layer; layer >= 0; layer--)
+    {
+      MEM_ROOT_SAVEPOINT memroot_sv;
+      root_make_savepoint(thd->mem_root, &memroot_sv);
+
+      MHNSW_param p(ctx, graph, layer);
+      uint max_nb= ctx->max_neighbors(layer);
+
+      // Allocate candidates with extra space for merging
+      // existing neighbors + search results
+      Neighborhood candidates;
+      candidates.init(thd->alloc<FVectorNode*>(max_nb + 7), max_nb);
+
+      // Seed with current neighbors
+      for (size_t j= 0; j < node->neighbors[layer].num; j++)
+      {
+        FVectorNode *nb= node->neighbors[layer].links[j];
+        if ((err= nb->load(graph)))
+        {
+          root_free_to_savepoint(&memroot_sv);
+          DBUG_RETURN(err);
+        }
+        candidates.links[candidates.num++]= nb;
+      }
+
+      // Fallback to graph entry point if no neighbors
+      if (!candidates.num)
+      {
+        if ((err= ctx->start->load(graph)))
+        {
+          root_free_to_savepoint(&memroot_sv);
+          DBUG_RETURN(err);
+        }
+        candidates.links[candidates.num++]= ctx->start;
+      }
+
+      // Search for better candidates with new ef_construction
+      if ((err= search_layer(&p, node->vec, NEAREST, max_nb,
+                             &candidates, true)))
+      {
+        root_free_to_savepoint(&memroot_sv);
+        DBUG_RETURN(err);
+      }
+
+      // Remove self from candidates (search_layer may find node itself)
+      size_t write= 0;
+      for (size_t j= 0; j < candidates.num; j++)
+      {
+        if (candidates.links[j] != node)
+          candidates.links[write++]= candidates.links[j];
+      }
+      candidates.num= write;
+
+      // Select best neighbors with new alpha
+      if (candidates.num > 0)
+      {
+        node->neighbors[layer].num= 0;
+        if ((err= select_neighbors(&p, node, candidates, nullptr, max_nb)))
+        {
+          root_free_to_savepoint(&memroot_sv);
+          DBUG_RETURN(err);
+        }
+      }
+
+      if ((err= update_second_degree_neighbors(&p, node)))
+      {
+        root_free_to_savepoint(&memroot_sv);
+        DBUG_RETURN(err);
+      }
+
+      root_free_to_savepoint(&memroot_sv);
+    }
+
+    if ((err= node->save(graph)))
+      DBUG_RETURN(err);
+  }
+
+  DBUG_RETURN(HA_ADMIN_OK);
 }
 
 const LEX_CSTRING mhnsw_hlindex_table_def(THD *thd, uint ref_length)
