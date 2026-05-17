@@ -28,8 +28,8 @@
 static constexpr float NEAREST = -1.0f;
 
 // Algorithm parameters
-static constexpr float alpha = 1.1f;
-static constexpr uint ef_construction= 10;
+static float alpha = 1.1f;
+static uint ef_construction= 10;
 static constexpr uint max_ef= 10000;
 static constexpr size_t subdist_part= 192;
 static constexpr float subdist_margin= 1.05f;
@@ -1723,6 +1723,343 @@ int mhnsw_delete_all(TABLE *table, KEY *keyinfo, bool truncate)
 
   ctx->release(table);
   return 0;
+}
+
+
+int mhnsw_optimize(TABLE *table)
+{
+  DBUG_ENTER("mhnsw_optimize");
+
+  int err= 0;
+
+  TABLE *graph= table->hlindex;  
+  THD *thd= table->in_use;      
+
+  MHNSW_Share *ctx= nullptr;   
+
+  KEY *keyinfo= table->key_info + table->s->keys;
+  Field *vec_field= keyinfo->key_part->field;  
+
+  // everything we need to remember about one vector row
+  struct MemNode {
+    uchar *tref;      // to reconnect edges with main graph
+    uchar *raw_vec;
+    const FVector *vec; // used for distance computations in NN-Descent
+  };
+  Dynamic_array<MemNode> mem_nodes(PSI_INSTRUMENT_MEM);
+  Dynamic_array<FVectorNode*> all_nodes(PSI_INSTRUMENT_MEM); // FVectorNode* in insertion order, needed so NN-Descent ids (array indices) map back to graph nodes during rebuild
+
+
+  DBUG_ASSERT(graph);
+  DBUG_ASSERT(keyinfo);
+  DBUG_ASSERT(keyinfo->algorithm == HA_KEY_ALG_VECTOR);
+
+  err= MHNSW_Share::acquire(&ctx, table, false);
+  if (err)
+  {
+    if (err == HA_ERR_END_OF_FILE)
+      DBUG_RETURN(HA_ADMIN_OK);
+    DBUG_RETURN(err);
+  }
+
+  size_t saved_byte_len= ctx->byte_len;  // save vec dimensionality because later we will need it when we delete the graph
+
+  // scan the graph shadow table + base table and load all vectors into mem_nodes
+  if ((err= graph->file->ha_rnd_init(1))) DBUG_RETURN(err);
+  if ((err= table->file->ha_rnd_init(0))) DBUG_RETURN(err);
+
+  {
+    MY_BITMAP *old_map= dbug_tmp_use_all_columns(graph, &graph->read_set);
+
+    while (!(err= graph->file->ha_rnd_next(graph->record[0])))
+    {
+      // read the tref column
+      String tbuf;
+      String *t= graph->field[FIELD_TREF]->val_str(&tbuf);
+
+      if (t && t->length() == table->file->ref_length)
+      {
+        // copy tref into mem_root 
+        uchar *t_copy = (uchar*)alloc_root(thd->mem_root, t->length());
+        memcpy(t_copy, t->ptr(), t->length());
+
+        MY_BITMAP *old_tmap = dbug_tmp_use_all_columns(table, &table->read_set);
+
+        // fetch vector from the base table
+        int t_err = table->file->ha_rnd_pos(table->record[0], t_copy);
+
+        if (!t_err)
+        {
+          String vec_buf;
+          String *res = vec_field->val_str(&vec_buf);
+          if (res && res->length() > 0)
+          {
+            // copy raw vector bytes into mem_root
+            uchar *v_copy = (uchar*)alloc_root(thd->mem_root, res->length());
+            memcpy(v_copy, res->ptr(), res->length());
+
+            MemNode node;
+            node.tref    = t_copy;
+            node.raw_vec = v_copy;
+
+            // parse FVector
+            void *mem = alloc_root(thd->mem_root, FVector::alloc_size(ctx->vec_len));
+            node.vec = FVector::create(ctx, mem, v_copy);
+
+            mem_nodes.push(node);
+          }
+        }
+        dbug_tmp_restore_column_map(&table->read_set, old_tmap);
+      }
+    }
+    dbug_tmp_restore_column_map(&graph->read_set, old_map);
+  }
+
+  graph->file->ha_rnd_end();
+  table->file->ha_rnd_end();
+
+  if (mem_nodes.size() == 0) DBUG_RETURN(HA_ADMIN_OK);
+
+  //  run NN-Descent
+  //
+  //    each node gets K random neighbors
+  //    iterate: for each node u, look at neighbors-of-neighbors (v's neighbors w)
+  //             if w is closer to u than u's worst current neighbor, replace it
+  //    converges when no swap happens in a full pass
+
+    const size_t K = ctx->max_neighbors(0)-6;
+  {
+    const size_t N = mem_nodes.size();
+
+    struct NNHit {
+      uint32_t id;   // index into mem_nodes[]
+      float    dist;
+      bool operator<(const NNHit &o) const { return dist < o.dist; }
+    };
+
+    // flat array: knn[u*K + j] = j-th nearest neighbor of node u
+    // stored sorted by distance ascending
+    NNHit *knn = (NNHit*)alloc_root(thd->mem_root, N * K * sizeof(NNHit));
+    if (!knn) DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+
+    // initialization: random neighbors 
+    for (size_t u = 0; u < N; u++)
+    {
+      for (size_t j = 0; j < K; j++)
+      {
+        uint32_t v;
+        // pick a random node that isn't u itself
+        do { v = (uint32_t)(my_rnd(&thd->rand) * N); } while (v == u || v >= N);
+        knn[u * K + j] = {v, mem_nodes[u].vec->distance_to(mem_nodes[v].vec, ctx->vec_len)};
+      }
+      std::sort(knn + u * K, knn + u * K + K);  // keep sorted so knn[u*K+K-1] is the worst neighbor
+    }
+
+    // scratch buffer for "neighbors of neighbors" candidate list, max size K*K
+    uint32_t *candidates_buf = (uint32_t*)alloc_root(thd->mem_root, K * K * sizeof(uint32_t));
+    if (!candidates_buf) DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+
+    // NN-Descent iterations 
+    bool changed = true;
+    for (int iter = 0; iter < 15 && changed; iter++) 
+    {
+      changed = false;
+      for (size_t u = 0; u < N; u++)
+      {
+        size_t c_count = 0;
+        for (size_t i = 0; i < K; i++)
+        {
+          uint32_t v = knn[u * K + i].id;
+          for (size_t j = 0; j < K; j++)
+          {
+            uint32_t w = knn[v * K + j].id;
+            if (w != u && w < N && c_count < K * K) candidates_buf[c_count++] = w;
+          }
+        }
+
+        // try each candidate w: if it's closer than u's current worst neighbor, swap it in
+        for (size_t i = 0; i < c_count; i++)
+        {
+          uint32_t w = candidates_buf[i];
+
+          // skip if w is already in u's neighbor list
+          bool exists = false;
+          for (size_t j = 0; j < K; j++)
+            if (knn[u * K + j].id == w) { exists = true; break; }
+          if (exists) continue;
+
+          float d = mem_nodes[u].vec->distance_to(mem_nodes[w].vec, ctx->vec_len);
+          if (d < knn[u * K + K - 1].dist) 
+          {
+            knn[u * K + K - 1] = {w, d};
+            // sort
+            for (int p = K - 1; p > 0; p--)
+            {
+              if (knn[u * K + p].dist < knn[u * K + p - 1].dist)
+                std::swap(knn[u * K + p], knn[u * K + p - 1]);
+              else break;
+            }
+            changed = true;
+          }
+        }
+      }
+    }
+
+    // delete the old graph
+    ctx->release(table); ctx= nullptr;
+
+    if ((err= mhnsw_delete_all(table, keyinfo, true))) DBUG_RETURN(err);
+
+    err= MHNSW_Share::acquire(&ctx, table, true);
+    if (err && err != HA_ERR_END_OF_FILE) DBUG_RETURN(err);
+
+    // restore vec dimensionality (delete_all resets it)
+    ctx->set_lengths(saved_byte_len);
+
+    double normalization_factor= 1.0 / std::log(ctx->M);
+
+    size_t max_nb_0= ctx->max_neighbors(0); 
+    size_t ef= std::max<size_t>(ef_construction, max_nb_0);
+
+    // allocate candidate buffer big enough for search_layer + NN-Descent edges
+    FVectorNode **cand_buf= (FVectorNode**)alloc_root(thd->mem_root, (ef + max_nb_0 + K) * sizeof(FVectorNode*));
+    if (!cand_buf) DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+
+    graph->file->extra(HA_EXTRA_WRITE_CACHE);  // buffer writes
+
+    if ((err= graph->file->ha_rnd_init(0))) DBUG_RETURN(err);
+
+    for (size_t i= 0; i < mem_nodes.size(); i++)
+    {
+      // savepoint so per-node temporaries get freed each iteration
+      MEM_ROOT_SAVEPOINT memroot_sv;
+      root_make_savepoint(thd->mem_root, &memroot_sv);
+
+      MemNode &ni= mem_nodes[i];
+
+      // layer assignment
+      double u_rnd= my_rnd(&thd->rand);
+      if (u_rnd <= 0.0) u_rnd= DBL_MIN;  
+      double logv= -std::log(u_rnd) * normalization_factor;
+
+      uint8_t current_max = ctx->start ? ctx->start->max_layer : 0;
+      uint8_t target_layer = std::min<uint8_t>((uint8_t)std::floor(logv), (uint8_t)(current_max + 1));
+
+      // allocate FVectorNode
+      FVectorNode *target= new (ctx->alloc_node()) FVectorNode(ctx, ni.tref, target_layer, ni.raw_vec);
+      all_nodes.push(target);  // keep pointer so NN-Descent ids can map back to FVectorNode*
+
+      // first node
+      if (!ctx->start)
+      {
+        target->neighbors[0].num = 0;
+        err= target->save(graph);
+        if (err)
+        {
+          root_free_to_savepoint(&memroot_sv);
+          DBUG_RETURN(err);
+        }
+        ctx->start= target;
+        root_free_to_savepoint(&memroot_sv);
+        continue;
+      }
+
+      //standard insertion 
+
+      Neighborhood candidates;
+      candidates.init(cand_buf, ef + max_nb_0 + K);
+
+      // load entry point
+      if ((err= ctx->start->load(graph)))
+      {
+        root_free_to_savepoint(&memroot_sv);
+        DBUG_RETURN(err);
+      }
+      candidates.links[candidates.num++]= ctx->start;
+
+      MHNSW_param p(ctx, graph, ctx->start->max_layer);
+      p.acc.graph_size= (double)(i + 1);
+
+      // --- upper layers: greedy descent, keep only 1 nearest (no linking) ---
+      for (; p.layer > (int)target_layer; p.layer--)
+      {
+        if ((err= search_layer(&p, target->vec, NEAREST, 1, &candidates, false)))
+        {
+          sql_print_error("mhnsw_optimize: search_layer(upper) failed i=%zu err=%d", i, err);
+          root_free_to_savepoint(&memroot_sv);
+          DBUG_RETURN(err);
+        }
+      }
+
+      for (; p.layer >= 0; p.layer--)
+      {
+        uint max_nb= ctx->max_neighbors(p.layer);
+        if ((err= search_layer(&p, target->vec, NEAREST,
+                               std::max<uint>(ef_construction, max_nb),
+                               &candidates, true)))
+        {
+          root_free_to_savepoint(&memroot_sv);
+          DBUG_RETURN(err);
+        }
+
+        // at layer 0 only: inject NN-Descent neighbors into the candidate set
+        // so select_neighbors can pick them
+        // only inject node v if v < i (already inserted)
+        if (p.layer == 0)
+        {
+          for (size_t j = 0; j < K; j++)
+          {
+            uint32_t v = knn[i * K + j].id;
+            if (v < i)
+            {
+              bool is_dup = false;
+              for (size_t l = 0; l < candidates.num; l++)
+                if (candidates.links[l] == all_nodes[v]) { is_dup = true; break; }
+              if (!is_dup && candidates.num < ef + max_nb_0)
+                candidates.links[candidates.num++] = all_nodes[v];
+            }
+          }
+        }
+
+        // pick final neighbors from candidates
+        if ((err= select_neighbors(&p, target, candidates, 0, max_nb)))
+        {
+          sql_print_error("mhnsw_optimize: select_neighbors failed i=%zu layer=%d err=%d", i, p.layer, err);
+          root_free_to_savepoint(&memroot_sv);
+          DBUG_RETURN(err);
+        }
+      }
+
+      // persist this node's edges
+      if ((err= target->save(graph)))
+      {
+        root_free_to_savepoint(&memroot_sv);
+        DBUG_RETURN(err);
+      }
+
+      ctx->add_to_stats(p.acc);
+
+      if (target_layer > ctx->start->max_layer)
+        ctx->start= target;
+
+      for (p.layer= target_layer; p.layer >= 0; p.layer--)
+      {
+        if ((err= update_second_degree_neighbors(&p, target)))
+        {
+          root_free_to_savepoint(&memroot_sv);
+          DBUG_RETURN(err);
+        }
+      }
+
+      root_free_to_savepoint(&memroot_sv); 
+    }
+
+    graph->file->ha_rnd_end();
+    graph->file->extra(HA_EXTRA_NO_CACHE);
+  }
+
+  ctx->release(table);
+  DBUG_RETURN(HA_ADMIN_OK);
 }
 
 const LEX_CSTRING mhnsw_hlindex_table_def(THD *thd, uint ref_length)
