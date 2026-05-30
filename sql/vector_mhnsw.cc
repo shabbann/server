@@ -28,8 +28,8 @@
 static constexpr float NEAREST = -1.0f;
 
 // Algorithm parameters
-static constexpr float alpha = 1.1f;
-static constexpr uint ef_construction= 10;
+static float alpha = 1.1f;
+static uint ef_construction= 10;
 static constexpr uint max_ef= 10000;
 static constexpr size_t subdist_part= 192;
 static constexpr float subdist_margin= 1.05f;
@@ -500,6 +500,9 @@ protected:
   Hash_set<FVectorNode> node_cache{PSI_INSTRUMENT_MEM, FVectorNode::get_key};
 
 public:
+  // allow accessing cache for LID computation
+  Hash_set<FVectorNode> &get_cache() { return node_cache; }
+
   ulonglong version= 0;                 // protected by commit_lock
   mysql_rwlock_t commit_lock;
   size_t vec_len= 0;
@@ -1723,6 +1726,337 @@ int mhnsw_delete_all(TABLE *table, KEY *keyinfo, bool truncate)
 
   ctx->release(table);
   return 0;
+}
+struct MemNode {
+  uchar *tref;
+  uchar *raw_vec;
+  const FVector *vec;
+  float lid;
+  FVectorNode *gnode;
+};
+
+static int cmp_lid_desc(const void *a, const void *b)
+{
+  float la= static_cast<const MemNode*>(a)->lid;
+  float lb= static_cast<const MemNode*>(b)->lid;
+  if (!std::isfinite(la)) la= -FLT_MAX;
+  if (!std::isfinite(lb)) lb= -FLT_MAX;
+  if (la > lb) return -1;
+  if (la < lb) return  1;
+  return 0;
+}
+
+int mhnsw_optimize(TABLE *table)
+{
+  DBUG_ENTER("mhnsw_optimize");
+
+  int err= 0;
+  TABLE *graph= table->hlindex;
+  THD *thd= table->in_use;
+  MHNSW_Share *ctx= nullptr;
+  KEY *keyinfo= table->key_info + table->s->keys;
+  Field *vec_field= keyinfo->key_part->field;
+
+  Dynamic_array<MemNode> mem_nodes(PSI_INSTRUMENT_MEM);
+
+  DBUG_ASSERT(graph);
+  DBUG_ASSERT(keyinfo);
+  DBUG_ASSERT(keyinfo->algorithm == HA_KEY_ALG_VECTOR);
+
+  err= MHNSW_Share::acquire(&ctx, table, false);
+  if (err)
+  {
+    if (err == HA_ERR_END_OF_FILE)
+      DBUG_RETURN(HA_ADMIN_OK);
+    DBUG_RETURN(err);
+  }
+
+  size_t saved_byte_len= ctx->byte_len;
+
+  
+    //scan graph + base table, collect all vectors into mem_nodes.
+    //also load each graph node into ctx cache so neighbors are available.
+  
+  if ((err= graph->file->ha_rnd_init(1))) DBUG_RETURN(err);
+  if ((err= table->file->ha_rnd_init(0))) DBUG_RETURN(err);
+
+  {
+    MY_BITMAP *old_map= dbug_tmp_use_all_columns(graph, &graph->read_set);
+
+    while (!(err= graph->file->ha_rnd_next(graph->record[0])))
+    {
+      if (graph->field[FIELD_TREF]->is_null())
+        continue;
+
+      String tbuf;
+      String *t= graph->field[FIELD_TREF]->val_str(&tbuf);
+      if (!t || t->length() != table->file->ref_length)
+        continue;
+
+      uchar *t_copy= (uchar*)alloc_root(thd->mem_root, t->length());
+      memcpy(t_copy, t->ptr(), t->length());
+
+      // Load graph node into ctx cache with neighbors 
+      graph->file->position(graph->record[0]);
+      FVectorNode *gnode= ctx->get_node(graph->file->ref);
+      gnode->load_from_record(graph);
+
+      MY_BITMAP *old_tmap= dbug_tmp_use_all_columns(table, &table->read_set);
+      int t_err= table->file->ha_rnd_pos(table->record[0], t_copy);
+      if (!t_err)
+      {
+        String vec_buf;
+        String *res= vec_field->val_str(&vec_buf);
+        if (res && res->length() > 0)
+        {
+          uchar *v_copy= (uchar*)alloc_root(thd->mem_root, res->length());
+          memcpy(v_copy, res->ptr(), res->length());
+
+          MemNode mn;
+          mn.tref= t_copy;
+          mn.raw_vec= v_copy;
+          void *mem= alloc_root(thd->mem_root, FVector::alloc_size(ctx->vec_len));
+          mn.vec= FVector::create(ctx, mem, v_copy);
+          mn.lid= 0.0f;
+          mn.gnode= gnode;
+          mem_nodes.push(mn);
+        }
+      }
+      dbug_tmp_restore_column_map(&table->read_set, old_tmap);
+    }
+    dbug_tmp_restore_column_map(&graph->read_set, old_map);
+  }
+
+  graph->file->ha_rnd_end();
+  table->file->ha_rnd_end();
+
+  if (mem_nodes.size() == 0)
+  {
+    ctx->release(table);
+    DBUG_RETURN(HA_ADMIN_OK);
+  }
+
+    //compute LID using MLE estimator from HNSW layer-0 neighbors.
+    //all FVectorNodes are loaded in ctx cache with neighbor pointers and vecs.
+  {
+    size_t max_k= ctx->max_neighbors(0);
+    float *dists= (float*)alloc_root(thd->mem_root, max_k * sizeof(float));
+    if (!dists)
+    {
+      ctx->release(table);
+      DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+    }
+
+    for (size_t i= 0; i < mem_nodes.size(); i++)
+    {
+      FVectorNode *fnode= mem_nodes[i].gnode;
+      if (fnode->deleted || !fnode->vec || !fnode->neighbors)
+        continue;
+
+      size_t K= fnode->neighbors[0].num;
+      if (K < 2) continue;
+
+      size_t valid= 0;
+      for (size_t j= 0; j < K; j++)
+      {
+        FVectorNode *nb= fnode->neighbors[0].links[j];
+        if (nb->vec)
+        {
+          float d= fnode->distance_to(nb->vec);
+          if (d > 0.0f)
+            dists[valid++]= d;
+        }
+      }
+      if (valid < 2) continue;
+
+      std::sort(dists, dists + valid);
+
+      // MLE LID: LID = -(K-1) / sum(log(d_i / d_K))
+      float d_k= dists[valid - 1];
+      float log_sum= 0.0f;
+      for (size_t j= 0; j < valid - 1; j++)
+        log_sum+= std::log(dists[j] / d_k);
+
+      float lid= (log_sum < 0.0f) ? -(float)(valid - 1) / log_sum : 0.0f;
+      mem_nodes[i].lid= lid;
+    }
+  }
+
+  // Phase 3: sort by LID descending 
+  mem_nodes.sort(cmp_lid_desc);
+
+  // Phase 4: delete old graph and rebuild in LID order
+  ctx->release(table);
+  ctx= nullptr;
+
+  if ((err= mhnsw_delete_all(table, keyinfo, true))) DBUG_RETURN(err);
+
+  err= MHNSW_Share::acquire(&ctx, table, true);
+  if (err && err != HA_ERR_END_OF_FILE) DBUG_RETURN(err);
+
+  ctx->set_lengths(saved_byte_len);
+
+  {
+    size_t max_nb_0= ctx->max_neighbors(0);
+    size_t ef= std::max<size_t>(ef_construction, max_nb_0);
+
+    /*
+      LID-driven deterministic layer assignment (HNSW++ Algorithm 4):
+      Nodes are already sorted by LID descending. We assign layers so that
+      layer l gets N/M^l nodes. High-LID nodes (first in the sorted order)
+      fill upper layers; low-LID nodes end up in layer 0.
+    */
+    const size_t N= mem_nodes.size();
+    const uint M= ctx->M;
+    uint8_t L_max= (uint8_t)std::floor(std::log((double)N) / std::log((double)M));
+    if (L_max > 20) L_max= 20; // safety cap
+
+    // Pre-compute target layer for each node by quota
+    uint8_t *assigned_layers= (uint8_t*)alloc_root(thd->mem_root, N);
+    if (!assigned_layers)
+    {
+      ctx->release(table);
+      DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+    }
+
+    {
+      size_t pos= 0;
+      for (int l= (int)L_max; l >= 1 && pos < N; l--)
+      {
+        /* Layer l gets approximately N / M^l nodes (exclusive to this layer) */
+        size_t quota= (size_t)std::round((double)N / std::pow((double)M, l));
+        /* Nodes at layer l are also in all layers below, so the quota is
+           the number of nodes that have max_layer = l, which is
+           N/M^l - N/M^(l+1) for intermediate layers. But simpler: fill
+           from the top — the first N/M^L_max nodes get layer L_max,
+           next batch gets layer L_max-1, etc. */
+        if (quota <= pos)
+          continue; // this layer's quota already filled by higher layers
+        size_t end= std::min(quota, N);
+        for (size_t j= pos; j < end; j++)
+          assigned_layers[j]= (uint8_t)l;
+        pos= end;
+      }
+      // remaining nodes go to layer 0
+      for (size_t j= pos; j < N; j++)
+        assigned_layers[j]= 0;
+    }
+
+    FVectorNode **cand_buf= (FVectorNode**)alloc_root(thd->mem_root,
+                               (ef + 7) * sizeof(FVectorNode*));
+    if (!cand_buf)
+    {
+      ctx->release(table);
+      DBUG_RETURN(HA_ERR_OUT_OF_MEM);
+    }
+
+    graph->file->extra(HA_EXTRA_WRITE_CACHE);
+    if ((err= graph->file->ha_rnd_init(0)))
+    {
+      ctx->release(table);
+      DBUG_RETURN(err);
+    }
+
+    for (size_t i= 0; i < mem_nodes.size(); i++)
+    {
+      MEM_ROOT_SAVEPOINT memroot_sv;
+      root_make_savepoint(thd->mem_root, &memroot_sv);
+
+      MemNode &ni= mem_nodes[i];
+      uint8_t target_layer= assigned_layers[i];
+
+      FVectorNode *target= new (ctx->alloc_node())
+                     FVectorNode(ctx, ni.tref, target_layer, ni.raw_vec);
+
+      if (!ctx->start)
+      {
+        target->neighbors[0].num= 0;
+        if ((err= target->save(graph)))
+        {
+          root_free_to_savepoint(&memroot_sv);
+          goto cleanup;
+        }
+        ctx->start= target;
+        root_free_to_savepoint(&memroot_sv);
+        continue;
+      }
+
+      Neighborhood candidates;
+      candidates.init(cand_buf, ef);
+
+      if ((err= ctx->start->load(graph)))
+      {
+        root_free_to_savepoint(&memroot_sv);
+        goto cleanup;
+      }
+      candidates.links[candidates.num++]= ctx->start;
+
+      MHNSW_param p(ctx, graph, ctx->start->max_layer);
+      p.acc.graph_size= (double)(i + 1);
+
+      for (; p.layer > (int)target_layer; p.layer--)
+      {
+        if ((err= search_layer(&p, target->vec, NEAREST, 1,
+                               &candidates, false)))
+        {
+          root_free_to_savepoint(&memroot_sv);
+          goto cleanup;
+        }
+      }
+
+      for (; p.layer >= 0; p.layer--)
+      {
+        uint max_nb= ctx->max_neighbors(p.layer);
+        if ((err= search_layer(&p, target->vec, NEAREST,
+                               std::max<uint>(ef_construction, max_nb),
+                               &candidates, true)))
+        {
+          root_free_to_savepoint(&memroot_sv);
+          goto cleanup;
+        }
+
+        if ((err= select_neighbors(&p, target, candidates, 0, max_nb)))
+        {
+          root_free_to_savepoint(&memroot_sv);
+          goto cleanup;
+        }
+      }
+
+      if ((err= target->save(graph)))
+      {
+        root_free_to_savepoint(&memroot_sv);
+        goto cleanup;
+      }
+
+      ctx->add_to_stats(p.acc);
+
+      if (target_layer > ctx->start->max_layer)
+        ctx->start= target;
+
+      for (p.layer= target_layer; p.layer >= 0; p.layer--)
+      {
+        if ((err= update_second_degree_neighbors(&p, target)))
+        {
+          root_free_to_savepoint(&memroot_sv);
+          goto cleanup;
+        }
+      }
+
+      root_free_to_savepoint(&memroot_sv);
+    }
+
+    graph->file->ha_rnd_end();
+    graph->file->extra(HA_EXTRA_NO_CACHE);
+  }
+
+  ctx->release(table);
+  DBUG_RETURN(HA_ADMIN_OK);
+
+cleanup:
+  graph->file->ha_rnd_end();
+  graph->file->extra(HA_EXTRA_NO_CACHE);
+  ctx->release(table);
+  DBUG_RETURN(err);
 }
 
 const LEX_CSTRING mhnsw_hlindex_table_def(THD *thd, uint ref_length)
