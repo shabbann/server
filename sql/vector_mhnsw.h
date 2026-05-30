@@ -33,6 +33,7 @@ int mhnsw_read_end(TABLE *table);
 int mhnsw_invalidate(TABLE *table, const uchar *rec, KEY *keyinfo);
 int mhnsw_delete_all(TABLE *table, KEY *keyinfo, bool truncate);
 void mhnsw_free(TABLE_SHARE *share);
+int mhnsw_optimize(TABLE *table);
 Item_func_vec_distance::distance_kind mhnsw_uses_distance(const TABLE *table, KEY *keyinfo);
 
 extern ha_create_table_option mhnsw_index_options[];
